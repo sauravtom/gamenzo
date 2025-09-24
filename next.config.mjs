@@ -2,9 +2,7 @@
 const nextConfig = {
     images: {
         remotePatterns: [
-            {
-                hostname: "placeholder.ai"
-            }
+            
         ]
     },
     async rewrites() {
