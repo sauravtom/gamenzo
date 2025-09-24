@@ -1,8 +1,6 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-// Removed GoogleGenerativeAI import - no longer using Gemini
-// Removed Anthropic import - now using API route
 import { Marked } from 'marked';
 import { markedHighlight } from 'marked-highlight';
 import hljs from 'highlight.js';
@@ -64,7 +62,6 @@ const POSTHOG_EVENTS = {
   CODE_EXECUTED: 'code_executed',
   GAME_PUBLISHED: 'game_published',
   GAME_UPDATED: 'game_updated',
-  AI_MODEL_CHANGED: 'ai_model_changed',
   CODE_MANUALLY_EDITED: 'code_manually_edited',
   GAME_RESET: 'game_reset',
   RUNTIME_ERROR: 'runtime_error',
@@ -88,19 +85,10 @@ enum ChatState {
   THINKING,
   CODING,
 }
+
 enum ChatTab {
   AI_CHAT,
   CODE,
-}
-
-enum AIModel {
-  GROK_FAST = 'grok',
-  NEMOTRON_NANO = 'nemotron',
-  DEEPSEEK_V31 = 'deepseek',
-  GPT_OSS_120B = 'gpt-oss',
-  CLAUDE = 'claude',
-  HORIZON_BETA = 'horizon',
-  QWEN_CODER = 'qwen',
 }
 
 type Message = {
@@ -123,8 +111,6 @@ type UserGame = {
   updatedAt: string;
 };
 
-type AIChat = null; // All models now use API routes
-
 // --- Constants ---
 const p5jsCdnUrl = 'https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.3/p5.min.js';
 
@@ -145,20 +131,6 @@ function draw() {
   // Frame drawing code goes here.
   background(175);
 }`;
-
-// --- SVGs as React Components ---
-const IconBusy = () => (
-  <svg className="rotating" xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor">
-    <path d="M480-80q-82 0-155-31.5t-127.5-86Q143-252 111.5-325T80-480q0-83 31.5-155.5t86-127Q252-817 325-848.5T480-880q17 0 28.5 11.5T520-840q0 17-11.5 28.5T480-800q-133 0-226.5 93.5T160-480q0 133 93.5 226.5T480-160q133 0 226.5-93.5T800-480q0-17 11.5-28.5T840-520q17 0 28.5 11.5T880-480q0 82-31.5 155t-86 127.5q-54.5 54.5-127 86T480-80Z" />
-  </svg>
-);
-
-const IconEdit = () => (
-    <svg xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="currentColor">
-        <path d="M120-120v-170l528-527q12-11 26.5-17t30.5-6q16 0 31 6t26 18l55 56q12 11 17.5 26t5.5 30q0 16-5.5 30.5T817-647L290-120H120Zm584-528 56-56-56-56-56 56 56 56Z" />
-    </svg>
-);
-
 
 // --- Main Playground Component ---
 export default function PlaygroundPage() {
@@ -182,11 +154,8 @@ export default function PlaygroundPage() {
   const [publishSuccessLink, setPublishSuccessLink] = useState<string | null>(null);
   const [publishedGame, setPublishedGame] = useState<{ id: string; slug: string } | null>(null);
 
-  const [selectedAIModel, setSelectedAIModel] = useState<AIModel>(AIModel.GROK_FAST);
-
   const previewFrameRef = useRef<HTMLIFrameElement>(null);
   const anchorRef = useRef<HTMLDivElement>(null);
-  const aiChatRef = useRef<AIChat>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const nextId = useRef(0);
   const defaultCode = useRef(EMPTY_CODE);
@@ -293,14 +262,119 @@ export default function PlaygroundPage() {
     return () => window.removeEventListener('message', handleIframeMessage);
   }, [runtimeErrorHandler]);
 
-  const initChat = useCallback((q: string | null) => {
-    // All models now use API routes, no client-side initialization needed
-    aiChatRef.current = null;
-    if (q) {
-        sendMessageAction(q);
-    }
-  }, [addMessage, selectedAIModel]);
+  const sendMessageAction = useCallback(async (messageText?: string, role: string = 'user') => {
+    if (chatState !== ChatState.IDLE) return;
+    
+    const msg = (messageText || inputMessage).trim();
+    if (!msg) return;
 
+    setChatState(ChatState.GENERATING);
+    if (!messageText) {
+      setInputMessage('');
+    }
+    if(role.toLowerCase() === 'user'){
+      addMessage('user', msg);
+    }
+
+    let fullMessage = msg;
+    if(codeHasChanged) {
+      fullMessage += '\n\nHere is the current code:\n```javascript\n' + code + '\n```';
+      setCodeHasChanged(false);
+    }
+    if (role.toLowerCase() === 'system') {
+      fullMessage = `Interpreter reported: ${msg}. Is it possible to improve that?`;
+    }
+
+    // Track AI message sent
+    posthog?.capture(POSTHOG_EVENTS.AI_MESSAGE_SENT, {
+      [POSTHOG_PROPERTIES.MESSAGE_LENGTH]: msg.length,
+      [POSTHOG_PROPERTIES.HAS_CODE_CONTEXT]: codeHasChanged,
+      message_role: role.toLowerCase(),
+    });
+
+    const currentMessageId = addMessage('assistant', '', '');
+    setMessages(prev => prev.map(m => m.id === currentMessageId ? { ...m, explanation: '...' } : m));
+
+    try {
+      // Direct call to Gemini API
+      const response = await fetch('/api/chat/gemini', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: fullMessage,
+          systemInstructions: SYSTEM_INSTRUCTIONS,
+          conversationHistory: messages.map(msg => ({
+            role: msg.role === 'user' ? 'user' : 'assistant',
+            content: msg.explanation
+          })),
+          currentCode: code
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('No response body');
+      }
+
+      const decoder = new TextDecoder();
+      let accumulatedText = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        accumulatedText += chunk;
+
+        setMessages(prev => prev.map(msg => 
+          msg.id === currentMessageId 
+            ? { ...msg, explanation: accumulatedText, isGeneratingCode: false }
+            : msg
+        ));
+        scrollToTheEnd();
+      }
+
+      const text = accumulatedText;
+      const p5CodeMatch = text.match(/```javascript\n([\s\S]*?)\n```/);
+      const p5Code = p5CodeMatch ? p5CodeMatch[1] : null;
+      let finalExplanation = text;
+
+      if (p5CodeMatch) {
+        finalExplanation = text.replace(p5CodeMatch[0], '').trim();
+      }
+
+      if (p5Code && p5Code.trim().length > 0) {
+        setCode(p5Code);
+        updateCodeSyntax(p5Code);
+        runCode(p5Code, 'auto');
+        if (!finalExplanation) {
+          finalExplanation = "Done. The code has been updated.";
+        }
+      } else if(!text.trim()) {
+        finalExplanation = 'There is no new code update.';
+      }
+
+      // Final update to the message with only the explanation
+      setMessages(prev => prev.map(m =>
+        m.id === currentMessageId
+          ? { ...m, explanation: finalExplanation, code: p5Code ?? undefined, isGeneratingCode: false }
+          : m
+      ));
+
+    } catch (e: any) {
+      console.error('AI API Error:', e);
+      addMessage('error', e.message || 'An error occurred.');
+    } finally {
+      setChatState(ChatState.IDLE);
+    }
+
+  }, [chatState, inputMessage, addMessage, code, codeHasChanged, runCode, updateCodeSyntax, messages, posthog, scrollToTheEnd]);
 
   // Initial page load effect - only runs once
   useEffect(() => {
@@ -308,7 +382,9 @@ export default function PlaygroundPage() {
     const q = urlParams.get('q');
     const editSlug = urlParams.get('edit');
     
-    initChat(q);
+    if (q) {
+      sendMessageAction(q);
+    }
     
     // Load game for editing if edit parameter is present
     if (editSlug && authenticated) {
@@ -339,457 +415,6 @@ export default function PlaygroundPage() {
     }
   };
 
-
-
-  // Separate effect for model changes - only reinitialize chat, don't reset everything
-  useEffect(() => {
-    // Only reinitialize chat when model changes, but don't reset code or messages
-    if (selectedAIModel) {
-      initChat(null);
-      
-      // Track AI model change
-      posthog?.capture(POSTHOG_EVENTS.AI_MODEL_CHANGED, {
-        [POSTHOG_PROPERTIES.AI_MODEL]: selectedAIModel,
-      });
-    }
-  }, [selectedAIModel, initChat, posthog]);
-
-  const sendMessageAction = useCallback(async (messageText?: string, role: string = 'user') => {
-    if (chatState !== ChatState.IDLE) return;
-    
-    const msg = (messageText || inputMessage).trim();
-    if (!msg) return;
-
-    // All models use API routes, no aiChatRef needed
-
-    setChatState(ChatState.GENERATING);
-    if (!messageText) {
-        setInputMessage('');
-    }
-    if(role.toLowerCase() === 'user'){
-        addMessage('user', msg);
-    }
-
-    let fullMessage = msg;
-    if(codeHasChanged) {
-        fullMessage += '\n\nHere is the current code:\n```javascript\n' + code + '\n```';
-        setCodeHasChanged(false);
-    }
-    if (role.toLowerCase() === 'system') {
-        fullMessage = `Interpreter reported: ${msg}. Is it possible to improve that?`;
-    }
-
-    // Track AI message sent
-    posthog?.capture(POSTHOG_EVENTS.AI_MESSAGE_SENT, {
-      [POSTHOG_PROPERTIES.AI_MODEL]: selectedAIModel,
-      [POSTHOG_PROPERTIES.MESSAGE_LENGTH]: msg.length,
-      [POSTHOG_PROPERTIES.HAS_CODE_CONTEXT]: codeHasChanged,
-      message_role: role.toLowerCase(),
-    });
-
-    const currentMessageId = addMessage('assistant', '', '');
-    setMessages(prev => prev.map(m => m.id === currentMessageId ? { ...m, explanation: '...' } : m));
-
-    try {
-        let text = '';
-        let thought = '';
-
-        if (selectedAIModel === AIModel.GROK_FAST) {
-          const response = await fetch('/api/chat/grok', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              message: inputMessage,
-              systemInstructions: SYSTEM_INSTRUCTIONS,
-              conversationHistory: messages.map(msg => ({
-                role: msg.role === 'user' ? 'user' : 'assistant',
-                content: msg.explanation
-              })),
-              currentCode: code
-            }),
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-          }
-
-          const reader = response.body?.getReader();
-          if (!reader) {
-            throw new Error('No response body');
-          }
-
-          const decoder = new TextDecoder();
-          let accumulatedText = '';
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            accumulatedText += chunk;
-
-            setMessages(prev => prev.map(msg => 
-              msg.id === currentMessageId 
-                ? { ...msg, explanation: accumulatedText, isGeneratingCode: false }
-                : msg
-            ));
-            scrollToTheEnd();
-          }
-          text = accumulatedText;
-        } else if (selectedAIModel === AIModel.NEMOTRON_NANO) {
-          const response = await fetch('/api/chat/nemotron', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              message: inputMessage,
-              systemInstructions: SYSTEM_INSTRUCTIONS,
-              conversationHistory: messages.map(msg => ({
-                role: msg.role === 'user' ? 'user' : 'assistant',
-                content: msg.explanation
-              })),
-              currentCode: code
-            }),
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-          }
-
-          const reader = response.body?.getReader();
-          if (!reader) {
-            throw new Error('No response body');
-          }
-
-          const decoder = new TextDecoder();
-          let accumulatedText = '';
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            accumulatedText += chunk;
-
-            setMessages(prev => prev.map(msg => 
-              msg.id === currentMessageId 
-                ? { ...msg, explanation: accumulatedText, isGeneratingCode: false }
-                : msg
-            ));
-            scrollToTheEnd();
-          }
-          text = accumulatedText;
-        } else if (selectedAIModel === AIModel.DEEPSEEK_V31) {
-          const response = await fetch('/api/chat/deepseek', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              message: inputMessage,
-              systemInstructions: SYSTEM_INSTRUCTIONS,
-              conversationHistory: messages.map(msg => ({
-                role: msg.role === 'user' ? 'user' : 'assistant',
-                content: msg.explanation
-              })),
-              currentCode: code
-            }),
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-          }
-
-          const reader = response.body?.getReader();
-          if (!reader) {
-            throw new Error('No response body');
-          }
-
-          const decoder = new TextDecoder();
-          let accumulatedText = '';
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            accumulatedText += chunk;
-
-            setMessages(prev => prev.map(msg => 
-              msg.id === currentMessageId 
-                ? { ...msg, explanation: accumulatedText, isGeneratingCode: false }
-                : msg
-            ));
-            scrollToTheEnd();
-          }
-          text = accumulatedText;
-        } else if (selectedAIModel === AIModel.GPT_OSS_120B) {
-          const response = await fetch('/api/chat/gpt-oss', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              message: inputMessage,
-              systemInstructions: SYSTEM_INSTRUCTIONS,
-              conversationHistory: messages.map(msg => ({
-                role: msg.role === 'user' ? 'user' : 'assistant',
-                content: msg.explanation
-              })),
-              currentCode: code
-            }),
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-          }
-
-          const reader = response.body?.getReader();
-          if (!reader) {
-            throw new Error('No response body');
-          }
-
-          const decoder = new TextDecoder();
-          let accumulatedText = '';
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            accumulatedText += chunk;
-
-            setMessages(prev => prev.map(msg => 
-              msg.id === currentMessageId 
-                ? { ...msg, explanation: accumulatedText, isGeneratingCode: false }
-                : msg
-            ));
-            scrollToTheEnd();
-          }
-          text = accumulatedText;
-        } else if (selectedAIModel === AIModel.CLAUDE) {
-          const response = await fetch('/api/chat/claude', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              message: fullMessage,
-              systemInstructions: SYSTEM_INSTRUCTIONS,
-              conversationHistory: messages.map(m => ({
-                role: m.role === 'user' ? 'user' : 'assistant',
-                content: m.explanation + (m.code ? `\n\`\`\`javascript\n${m.code}\n\`\`\`` : '')
-              })).filter(m => m.content !== '...'),
-              currentCode: code,
-            }),
-          });
-
-          if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || 'Claude API request failed');
-          }
-
-          if (!response.body) {
-            throw new Error('Response body is empty');
-          }
-      
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let accumulatedText = '';
-      
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-              break;
-            }
-            const chunk = decoder.decode(value, { stream: true });
-            accumulatedText += chunk;
-
-            const codeBlockStartIndex = accumulatedText.indexOf('```javascript');
-            
-            if (codeBlockStartIndex !== -1) {
-              const explanation = accumulatedText.substring(0, codeBlockStartIndex);
-              setMessages(prev => prev.map(m =>
-                m.id === currentMessageId
-                ? { 
-                    ...m, 
-                    explanation: explanation,
-                    isGeneratingCode: true,
-                  }
-                : m
-              ));
-            } else {
-              setMessages(prev => prev.map(m =>
-                m.id === currentMessageId
-                ? { ...m, explanation: accumulatedText, isGeneratingCode: false }
-                : m
-              ));
-            }
-            scrollToTheEnd();
-          }
-          text = accumulatedText;
-        } else if (selectedAIModel === AIModel.HORIZON_BETA) {
-          const response = await fetch('/api/chat/horizon', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              message: fullMessage,
-              systemInstructions: SYSTEM_INSTRUCTIONS,
-              conversationHistory: messages.map(m => ({
-                role: m.role === 'user' ? 'user' : 'assistant',
-                content: m.explanation + (m.code ? `\n\`\`\`javascript\n${m.code}\n\`\`\`` : '')
-              })).filter(m => m.content !== '...'),
-              currentCode: code,
-            }),
-          });
-
-          if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || 'Horizon Beta API request failed');
-          }
-
-          if (!response.body) {
-            throw new Error('Response body is empty');
-          }
-      
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let accumulatedText = '';
-      
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-              break;
-            }
-            const chunk = decoder.decode(value, { stream: true });
-            accumulatedText += chunk;
-
-            const codeBlockStartIndex = accumulatedText.indexOf('```javascript');
-            
-            if (codeBlockStartIndex !== -1) {
-              const explanation = accumulatedText.substring(0, codeBlockStartIndex);
-              setMessages(prev => prev.map(m =>
-                m.id === currentMessageId
-                ? { 
-                    ...m, 
-                    explanation: explanation,
-                    isGeneratingCode: true,
-                  }
-                : m
-              ));
-            } else {
-              setMessages(prev => prev.map(m =>
-                m.id === currentMessageId
-                ? { ...m, explanation: accumulatedText, isGeneratingCode: false }
-                : m
-              ));
-            }
-            scrollToTheEnd();
-          }
-          text = accumulatedText;
-        } else if (selectedAIModel === AIModel.QWEN_CODER) {
-          const response = await fetch('/api/chat/qwen', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              message: fullMessage,
-              systemInstructions: SYSTEM_INSTRUCTIONS,
-              conversationHistory: messages.map(m => ({
-                role: m.role === 'user' ? 'user' : 'assistant',
-                content: m.explanation + (m.code ? `\n\`\`\`javascript\n${m.code}\n\`\`\`` : '')
-              })).filter(m => m.content !== '...'),
-              currentCode: code,
-            }),
-          });
-
-          if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || 'Qwen Coder API request failed');
-          }
-
-          if (!response.body) {
-            throw new Error('Response body is empty');
-          }
-      
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let accumulatedText = '';
-      
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-              break;
-            }
-            const chunk = decoder.decode(value, { stream: true });
-            accumulatedText += chunk;
-
-            const codeBlockStartIndex = accumulatedText.indexOf('```javascript');
-            
-            if (codeBlockStartIndex !== -1) {
-              const explanation = accumulatedText.substring(0, codeBlockStartIndex);
-              setMessages(prev => prev.map(m =>
-                m.id === currentMessageId
-                ? { 
-                    ...m, 
-                    explanation: explanation,
-                    isGeneratingCode: true,
-                  }
-                : m
-              ));
-            } else {
-              setMessages(prev => prev.map(m =>
-                m.id === currentMessageId
-                ? { ...m, explanation: accumulatedText, isGeneratingCode: false }
-                : m
-              ));
-            }
-            scrollToTheEnd();
-          }
-          text = accumulatedText;
-        }
-
-        const p5CodeMatch = text.match(/```javascript\n([\s\S]*?)\n```/);
-        const p5Code = p5CodeMatch ? p5CodeMatch[1] : null;
-        let finalExplanation = text;
-
-        if (p5CodeMatch) {
-            finalExplanation = text.replace(p5CodeMatch[0], '').trim();
-        }
-
-        if (p5Code && p5Code.trim().length > 0) {
-            setCode(p5Code);
-            updateCodeSyntax(p5Code);
-            runCode(p5Code, 'auto');
-            if (!finalExplanation) {
-                finalExplanation = "Done. The code has been updated.";
-            }
-        } else if(!text.trim()) {
-            finalExplanation = 'There is no new code update.';
-        }
-
-        // Final update to the message with only the explanation
-        setMessages(prev => prev.map(m =>
-            m.id === currentMessageId
-            ? { ...m, explanation: finalExplanation, code: p5Code ?? undefined, isGeneratingCode: false, thinking: thought }
-            : m
-        ));
-
-    } catch (e: any) {
-        console.error('AI API Error:', e);
-        addMessage('error', e.message || 'An error occurred.');
-    } finally {
-        setChatState(ChatState.IDLE);
-    }
-
-  }, [chatState, inputMessage, addMessage, code, codeHasChanged, runCode, updateCodeSyntax, selectedAIModel, messages, posthog]);
-
   const handleCodeChange = (newCode: string) => {
     if (chatState !== ChatState.IDLE) return;
     setCode(newCode);
@@ -810,7 +435,6 @@ export default function PlaygroundPage() {
     setMessages([]);
     setCodeHasChanged(true);
     setPublishedGame(null);
-    initChat(null);
     
     // Track game reset
     posthog?.capture(POSTHOG_EVENTS.GAME_RESET, {
@@ -842,7 +466,6 @@ export default function PlaygroundPage() {
       const game = await response.json();
 
       if (!response.ok) {
-        // This will now be caught by the catch block
         throw new Error(game.error || 'Failed to publish');
       }
       
@@ -880,7 +503,8 @@ export default function PlaygroundPage() {
       <div className="bg-card border-b border-border sticky top-0 z-50 shadow-sm">
         <div className="max-w-7xl mx-auto">
           <div className="flex items-center justify-between h-16">
-            <div className="flex items-center space-x-6">              <div className="flex items-center space-x-2">
+            <div className="flex items-center space-x-6">
+              <div className="flex items-center space-x-2">
                 <div className="w-8 h-8 rounded-lg overflow-hidden flex items-center justify-center">
                   <Image src="/icon.webp" alt="Gamenzo" width={32} height={32} className="rounded-lg" />
                 </div>
@@ -981,26 +605,7 @@ export default function PlaygroundPage() {
           {/* AI Chat Tab */}
           {selectedChatTab === ChatTab.AI_CHAT && (
             <div className="flex flex-col h-full overflow-hidden">
-              {/* Model Selector */}
-              <div className="p-4 border-b border-border bg-muted/20 flex-shrink-0">
-                <label className="block text-sm font-medium text-foreground mb-2">AI Model:</label>
-                <select 
-                  value={selectedAIModel} 
-                  onChange={(e) => {
-                    setSelectedAIModel(e.target.value as AIModel);
-                    // Chat reinitialization is now handled by useEffect
-                  }}
-                  disabled={false}
-                  className="w-full bg-background border border-border rounded-lg px-3 py-2 text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent disabled:opacity-50"
-                >
-                  <option value={AIModel.GROK_FAST}>Grok 4 Fast</option>
-                  <option value={AIModel.NEMOTRON_NANO}>Nemotron Nano 9B V2</option>
-                  <option value={AIModel.DEEPSEEK_V31}>DeepSeek V3.1</option>
-                  <option value={AIModel.GPT_OSS_120B}>GPT OSS 120B</option>
-                </select>
-              </div>
-
-              {/* Chat Messages */}
+              {/* Chat Messages - No Model Selector */}
               <ScrollArea className="flex-1 px-4 min-h-0">
                 <div className="space-y-4 py-4">
                   {messages.map((msg) => (
