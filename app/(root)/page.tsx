@@ -14,7 +14,7 @@ import { Meteors } from "@/components/magicui/meteors"
 import { BlurFade } from "@/components/magicui/blur-fade"
 
 // Import existing components
-import AIInput from "@/components/AIInput"
+
 import Categories from "@/components/categories"
 import List from "@/components/list"
 import CommunityGames from "@/components/community-games"
